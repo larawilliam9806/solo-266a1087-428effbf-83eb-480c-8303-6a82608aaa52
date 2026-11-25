@@ -2,13 +2,14 @@ import io
 import json
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from app import create_app
 from app.db import Database
-from app.errors import NotFoundError, ValidationError
+from app.errors import LockUnavailableError, NotFoundError, ValidationError
 from app.hll import REGISTER_COUNT, build_summary, hll_register
 
 ZERO = [0] * REGISTER_COUNT
@@ -365,3 +366,229 @@ def test_http_get_branch_report_and_health(client):
     assert r.get_json()["registers"][2] == 8
     assert client.get("/health").status_code == 200
     assert client.get("/").status_code == 200
+
+
+# ---------- 写锁争用：1s 入账窗口、2s 可重试失败、读取不被阻塞 ----------
+
+
+class HeldWriteLock:
+    """在独立连接上持有 BEGIN IMMEDIATE 写锁的测试夹具。"""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.conn: sqlite3.Connection | None = None
+
+    def __enter__(self) -> "HeldWriteLock":
+        self.conn = self.db._connect(for_write=True)
+        self.conn.execute("BEGIN IMMEDIATE")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        assert self.conn is not None
+        self.conn.rollback()
+        self.conn.close()
+
+
+def test_write_succeeds_when_lock_frees_within_one_second(db):
+    # 只有一笔合法写请求争用写锁，锁在收到请求后 1 秒内释放 => 照常入账
+    holder = db._connect(for_write=True)
+    holder.execute("BEGIN IMMEDIATE")  # 先占住写锁
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            db.upsert_report, "2026-11", "ER-1", "LIB-A", regs({0: 7})
+        )
+        time.sleep(0.1)  # 确保写请求已进入锁等待
+        started = time.monotonic()
+        time.sleep(0.4)  # 在 1s 预算内释放写锁
+        holder.rollback()
+        holder.close()
+        result = future.result()
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert result["merged"][0] == 7
+    assert db.get_report("2026-11", "ER-1", "LIB-A")["registers"][0] == 7
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda db: db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 7})),
+        lambda db: db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 9})),  # 换报
+        lambda db: db.withdraw_report("2026-11", "ER-1", "LIB-A"),
+    ],
+)
+def test_contended_write_fails_within_two_seconds_and_changes_nothing(db, operation):
+    # 先落一笔已提交数据作为基线
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    baseline_report = db.get_report("2026-11", "ER-1", "LIB-A")
+    baseline_merged = db.get_merged("2026-11", "ER-1")
+
+    with HeldWriteLock(db):
+        started = time.monotonic()
+        with pytest.raises(LockUnavailableError):
+            operation(db)
+        elapsed = time.monotonic() - started
+
+    # 锁持续占用：必须在 2s 内返回失败
+    assert elapsed < 2.0
+    # 失败的请求不能入账，也不能改变合并摘要
+    assert db.get_report("2026-11", "ER-1", "LIB-A") == baseline_report
+    assert db.get_merged("2026-11", "ER-1") == baseline_merged
+
+
+def test_sixteen_contending_writers_download_returns_last_commit_within_one_second(tmp_path):
+    db = Database(str(tmp_path / "contend.sqlite3"))
+    # 最近一次已提交的合并摘要基线（种子馆 LIB-00，与下面 16 个写馆不重名）
+    db.upsert_report("2026-11", "ER-1", "LIB-00", regs({0: 42}))
+    committed = db.get_merged("2026-11", "ER-1")
+    assert committed["registers"][0] == 42
+
+    branches = [f"LIB-{i:02d}" for i in range(1, 17)]  # LIB-01 … LIB-16
+    barrier = threading.Barrier(len(branches) + 1)
+    results: list[object] = []
+
+    def writer(branch: str):
+        barrier.wait()
+        try:
+            db.upsert_report("2026-11", "ER-1", branch, regs({1: 3}))
+            results.append("ok")
+        except LockUnavailableError:
+            results.append("locked")
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(writer, b) for b in branches]
+        barrier.wait()  # 16 笔写请求同时开抢写锁
+        started = time.monotonic()
+        # 数据员在争用最激烈时发起下载
+        snapshot = db.get_merged("2026-11", "ER-1")
+        elapsed = time.monotonic() - started
+        for future in futures:
+            future.result()
+
+    assert elapsed < 1.0
+    # 拿到的是最近一次已提交的合并 JSON（下载不被写锁阻塞）
+    assert snapshot == committed
+    # 写锁串行化：拿到锁的请求全部成功，没拿到的全部明确失败，没有静默丢请求
+    assert len(results) == 16
+    assert set(results) <= {"ok", "locked"}
+    assert "ok" in results
+    # 已入账的馆报与合并摘要保持一致（成功时馆报和合并摘要一起生效）
+    merged = db.get_merged("2026-11", "ER-1")["registers"]
+    assert merged[0] == 42  # 种子馆的贡献始终保留
+    assert merged[1] == 3  # 至少一笔写请求入账
+    for branch in branches:
+        report = db.get_report("2026-11", "ER-1", branch)
+        assert report["registers"][1] == 3
+        assert report["registers"][0] == 0
+
+
+def test_http_lock_contention_returns_503_retryable_within_two_seconds(tmp_path):
+    app = create_app(str(tmp_path / "web-lock.sqlite3"))
+    client = app.test_client()
+    db: Database = app.config["DATABASE"]
+    client.post("/reports", json=_payload(reg_overrides={0: 5}))
+
+    with HeldWriteLock(db):
+        started = time.monotonic()
+        r = client.post("/reports", json=_payload(reg_overrides={0: 9}))
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert r.status_code == 503
+    body = r.get_json()
+    assert body["retryable"] is True
+    assert "重试" in body["error"]
+    assert r.headers["Retry-After"] == "1"
+
+    # 撤回同样在 2s 内返回可重试失败
+    with HeldWriteLock(db):
+        started = time.monotonic()
+        r = client.post(
+            "/reports/withdraw",
+            json={"month": "2026-11", "resource": "ER-1", "branch": "LIB-A"},
+        )
+        elapsed = time.monotonic() - started
+    assert elapsed < 2.0
+    assert r.status_code == 503
+    assert r.get_json()["retryable"] is True
+
+    # 数据未变
+    assert client.get("/reports/2026-11/ER-1/LIB-A").get_json()["registers"][0] == 5
+    assert client.get("/merged/2026-11/ER-1/download").get_json()["registers"][0] == 5
+
+
+def test_http_lock_failure_html_form_redirects_with_retry_hint(tmp_path):
+    app = create_app(str(tmp_path / "web-html.sqlite3"))
+    client = app.test_client()
+    db: Database = app.config["DATABASE"]
+
+    with HeldWriteLock(db):
+        r = client.post(
+            "/reports/withdraw",
+            data={"month": "2026-11", "resource": "ER-1", "branch": "LIB-A"},
+        )
+    assert r.status_code == 302
+    location = r.headers["Location"]
+    assert "status=503" in location
+    page = client.get(location)
+    assert page.status_code == 200
+    assert "重试".encode() in page.data
+
+
+def test_failed_request_does_not_open_a_write_transaction(db):
+    # 锁等待失败时连接上不存在未提交事务，回滚/关闭都干净，库内无残留
+    with HeldWriteLock(db):
+        conn = db._connect(for_write=True)
+        try:
+            with pytest.raises(LockUnavailableError):
+                db._transaction(conn)
+            # 没有活动事务：再开一个只读语句不会报 "cannot start a transaction"
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            assert mode.lower() == "wal"
+        finally:
+            conn.close()
+
+
+def test_custom_lock_timeout_is_honored(tmp_path):
+    # 更短的锁等待预算 => 更快失败，但仍是可重试的 LockUnavailableError
+    fast = Database(str(tmp_path / "fast.sqlite3"), lock_timeout=0.3)
+    fast.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    with HeldWriteLock(fast):
+        started = time.monotonic()
+        with pytest.raises(LockUnavailableError):
+            fast.upsert_report("2026-11", "ER-1", "LIB-B", regs({0: 9}))
+        elapsed = time.monotonic() - started
+    assert 0.3 <= elapsed < 1.0
+    # 数据保持基线
+    assert fast.get_merged("2026-11", "ER-1")["registers"][0] == 5
+
+
+def test_retry_after_failure_then_succeeds(db):
+    # 模拟客户端重试：锁占用期失败，释放后原样重发即成功入账
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    holder = db._connect(for_write=True)
+    holder.execute("BEGIN IMMEDIATE")
+    with pytest.raises(LockUnavailableError):
+        db.upsert_report("2026-11", "ER-1", "LIB-B", regs({0: 9}))
+    holder.rollback()
+    holder.close()
+    # 释放后重试同一请求
+    result = db.upsert_report("2026-11", "ER-1", "LIB-B", regs({0: 9}))
+    assert result["merged"][0] == 9
+    assert db.get_report("2026-11", "ER-1", "LIB-B")["registers"][0] == 9
+
+
+def test_download_and_branch_read_unaffected_by_write_lock(db):
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5, 2: 8}))
+    committed = db.get_merged("2026-11", "ER-1")
+    with HeldWriteLock(db):
+        started = time.monotonic()
+        merged = db.get_merged("2026-11", "ER-1")
+        report = db.get_report("2026-11", "ER-1", "LIB-A")
+        elapsed = time.monotonic() - started
+    # 只读路径不被写锁阻塞，远在 1s 内返回已提交快照
+    assert elapsed < 1.0
+    assert merged == committed
+    assert report["registers"][2] == 8

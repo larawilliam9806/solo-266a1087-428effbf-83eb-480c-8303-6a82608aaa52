@@ -33,9 +33,11 @@ SQLite 数据持久化在命名卷 `hll-data`（容器内 `/data/hll.sqlite3`）
 ```bash
 pip install -r requirements.txt
 export HLL_DB_PATH=./data/hll.sqlite3
+# 可选：写锁等待上限（秒，默认 1.0），超时返回 503 可重试
+# export HLL_LOCK_TIMEOUT=1.0
 python wsgi.py          # Flask 开发服务器
 # 生产 WSGI（与容器内一致）：
-gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 4 wsgi:app
+gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 16 wsgi:app
 ```
 
 ## 统一哈希口径（各馆必须一致）
@@ -57,6 +59,24 @@ gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 4 wsgi:app
 | `GET` | `/reports/<month>/<resource>/<branch>` | 查本馆现行报送 |
 | `GET` | `/merged/<month>/<resource>/download` | 下载已保存的合并摘要 JSON |
 | `GET` | `/health` | 健康检查 |
+
+### 写锁争用：1 秒入账窗口与 503 可重试失败
+
+报送、换报、撤回都是写事务（`BEGIN IMMEDIATE`），SQLite 同一时刻只允许一个写事务：
+
+- **只有一笔写请求争用写锁，且锁在收到请求后 1 秒内释放**：立即拿到锁，**照常入账**；
+- **写锁持续占用超过 1 秒**：在 **2 秒内返回 `503 Service Unavailable`**，响应体
+  `{"error": "...请稍后重试", "retryable": true}` 并带 `Retry-After: 1` 头；
+  该请求**从未开启写事务，因此不会入账，也不会改变合并摘要**，原样重试即可；
+- 浏览器表单提交遇 503 会跳回报送页，红字提示“本次请求没有入账……请重试”。
+
+写锁等待上限由环境变量 `HLL_LOCK_TIMEOUT`（秒，默认 `1.0`）控制。
+
+### 下载不被写锁阻塞
+
+合并摘要走独立的只读连接。WAL 模式下读不阻塞写、写也不阻塞读：哪怕 16 笔写请求
+正在争用写锁，数据员发起下载也会在 **1 秒内拿到最近一次已提交的合并 JSON**
+（争用中尚未提交的写请求对其不可见）。
 
 报送 JSON 格式：
 
@@ -114,12 +134,15 @@ curl -OJ localhost:8000/merged/2026-11/ER-0001/download
 或 commit 失败即 `ROLLBACK`，库内保留原数据（测试
 `test_commit_failure_keeps_original_data` 模拟 commit 失败验证）。
 
-### 3. 不同馆并发更改，每笔成功操作都计入汇总
+### 3. 不同馆并发更改，写锁有界等待，失败可重试且不入账
 
-- WAL 模式 + `busy_timeout=30s` + 应用层指数退避重试，写事务经
-  `BEGIN IMMEDIATE` 在 SQLite 层串行化，杜绝写写冲突导致的丢更新；
+- WAL 模式 + 写事务经 `BEGIN IMMEDIATE` 在 SQLite 层串行化，杜绝写写冲突导致的丢更新；
+- 写锁等待**严格限定在 1 秒**（应用层 deadline + 分档 `busy_timeout`），不再做最长 30 秒的
+  阻塞等待：锁在窗口内释放即入账，超时抛 `LockUnavailableError` → HTTP `503`，
+  并在 2 秒内返回“可重试”。失败时连接上没有任何已开启的写事务，库内馆报与合并摘要原样保留；
 - 每个事务只做本馆差分，事务结束后的合并摘要始终等于全部已提交馆报的
-  逐位置最大值（并发用例见 `test_concurrent_*`）。
+  逐位置最大值（并发用例见 `test_concurrent_*`、写锁争用用例见 `test_*lock*` /
+  `test_sixteen_contending_writers_*`）。
 
 ### 4. 无报送与全撤回
 

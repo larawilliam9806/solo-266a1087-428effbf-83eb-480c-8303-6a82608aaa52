@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     environment:
       HLL_DB_PATH: /data/hll.sqlite3
+      # 写锁等待上限（秒，默认 1.0）：超时返回 503 可重试，请求不入账
+      HLL_LOCK_TIMEOUT: "1.0"
     volumes:
       - hll-data:/data
     healthcheck:

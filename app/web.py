@@ -16,16 +16,34 @@ from flask import (
     url_for,
 )
 
-from .db import Database
-from .errors import NotFoundError, ValidationError
+from .db import DEFAULT_LOCK_TIMEOUT, Database
+from .errors import LockUnavailableError, NotFoundError, ValidationError
 
 
-def create_app(db_path: str | None = None) -> Flask:
+def create_app(
+    db_path: str | None = None, lock_timeout: float | None = None
+) -> Flask:
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or os.environ.get(
         "HLL_DB_PATH", "/data/hll.sqlite3"
     )
-    app.config["DATABASE"] = Database(app.config["DB_PATH"])
+    if lock_timeout is None:
+        raw = os.environ.get("HLL_LOCK_TIMEOUT")
+        if raw is None:
+            lock_timeout = DEFAULT_LOCK_TIMEOUT
+        else:
+            try:
+                lock_timeout = float(raw)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"HLL_LOCK_TIMEOUT 必须是秒数（数值），收到 {raw!r}"
+                ) from exc
+            if lock_timeout <= 0:
+                raise RuntimeError("HLL_LOCK_TIMEOUT 必须是正数（秒）")
+    app.config["LOCK_TIMEOUT"] = float(lock_timeout)
+    app.config["DATABASE"] = Database(
+        app.config["DB_PATH"], lock_timeout=app.config["LOCK_TIMEOUT"]
+    )
 
     def get_db() -> Database:
         return app.config["DATABASE"]
@@ -84,13 +102,20 @@ def create_app(db_path: str | None = None) -> Flask:
 
     @app.errorhandler(ValidationError)
     @app.errorhandler(NotFoundError)
+    @app.errorhandler(LockUnavailableError)
     def _handle_known_error(err: Exception) -> Response:
         message = getattr(err, "message", str(err))
         status = getattr(err, "status", 400)
         if _wants_html():
             return redirect(url_for("index", error=message, status=status))
-        response = jsonify({"error": message})
+        body: dict[str, Any] = {"error": message}
+        if getattr(err, "retryable", False):
+            # 写锁争用导致的可重试失败：请求未入账，客户端应原样重试。
+            body["retryable"] = True
+        response = jsonify(body)
         response.status_code = status
+        if getattr(err, "retryable", False):
+            response.headers["Retry-After"] = "1"
         return response
 
     # -- 页面 ------------------------------------------------------------

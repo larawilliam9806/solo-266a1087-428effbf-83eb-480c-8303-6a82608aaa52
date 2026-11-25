@@ -25,7 +25,7 @@ import threading
 import time
 from typing import Any
 
-from .errors import NotFoundError
+from .errors import LockUnavailableError, NotFoundError
 from .hll import REGISTER_COUNT, validate_identifier, validate_month, validate_registers
 
 SCHEMA = """
@@ -59,36 +59,47 @@ CREATE TABLE IF NOT EXISTS merged_summaries (
 ) WITHOUT ROWID;
 """
 
-_BUSY_RETRIES = 8
-_BUSY_BACKOFF = 0.02  # 秒，指数退避：0.02, 0.04, ...
+# 写锁等待上限：收到写请求后，BEGIN IMMEDIATE 在此时间内拿到锁就照常入账；
+# 超时则抛 LockUnavailableError（HTTP 503，可重试），全程不开启写事务。
+DEFAULT_LOCK_TIMEOUT = 1.0
+# 读连接的 busy_timeout：WAL 下读基本不被写阻塞，仅在 checkpoint 等罕见
+# 场景短暂等待，0.5s 足以保证下载远在 1s 预算内返回最近一次已提交快照。
+READ_BUSY_TIMEOUT = 0.5
+# 单次 BEGIN IMMEDIATE 在内核 busy handler 内的等待粒度；外层用 deadline 兜底。
+_LOCK_POLL_GRANULARITY = 0.25
+_BUSY_ERROR_MSGS = ("database is locked", "database table is locked", "database schema is locked")
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, lock_timeout: float = DEFAULT_LOCK_TIMEOUT):
         self.path = path
+        # 写锁等待上限可由部署方按环境调整，但语义不变：超时即可重试的失败。
+        self.lock_timeout = float(lock_timeout)
         self._init_lock = threading.Lock()
         self._initialized = False
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, for_write: bool) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.path,
-            timeout=30.0,
+            # 外层自行用 deadline 控制等待，sqlite3.connect 的 timeout 只是兜底。
+            timeout=self.lock_timeout if for_write else READ_BUSY_TIMEOUT,
             isolation_level=None,  # 事务完全由显式 BEGIN/COMMIT 控制
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA foreign_keys = ON")
+        # WAL 模式在 _ensure_schema 中一次性落库（持久属性），每个请求连接
+        # 不再重复切换 journal_mode，避免读连接在写锁占用期做额外元数据操作。
+        if for_write:
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _ensure_schema(self) -> None:
         with self._init_lock:
             if self._initialized:
                 return
-            conn = self._connect()
+            conn = self._connect(for_write=True)
             try:
                 conn.executescript(SCHEMA)
             finally:
@@ -102,17 +113,36 @@ class Database:
         """单独抽出便于测试注入提交失败；正常路径即 SQLite 提交。"""
         conn.commit()
 
+    @staticmethod
+    def _is_busy(exc: sqlite3.OperationalError) -> bool:
+        message = str(exc).lower()
+        return any(token in message for token in _BUSY_ERROR_MSGS)
+
     def _transaction(self, conn: sqlite3.Connection) -> sqlite3.Cursor:
-        """开启写事务，遇锁按退避重试；BEGIN IMMEDIATE 保证写操作串行化。"""
-        last_error: Exception | None = None
-        for attempt in range(_BUSY_RETRIES):
+        """开启写事务（BEGIN IMMEDIATE），写锁等待严格限定在 lock_timeout 内。
+
+        - 锁在预算内释放：立刻拿到锁并返回，请求照常入账；
+        - 预算耗尽仍被占用：抛 LockUnavailableError。此时从未成功开启事务，
+          库内数据与合并摘要完全不变，调用方可安全重试。
+        """
+        deadline = time.monotonic() + self.lock_timeout
+        last_error: sqlite3.OperationalError | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # 让 SQLite 内核先等一小段，避免忙等占满 GIL；单次等待不超过剩余预算。
+            conn.execute(f"PRAGMA busy_timeout = {int(min(remaining, _LOCK_POLL_GRANULARITY) * 1000)}")
             try:
                 return conn.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as exc:  # database is locked / busy
+            except sqlite3.OperationalError as exc:
+                if not self._is_busy(exc):
+                    raise
                 last_error = exc
-                time.sleep(_BUSY_BACKOFF * (2**attempt))
         assert last_error is not None
-        raise last_error
+        raise LockUnavailableError(
+            f"数据库写锁在 {self.lock_timeout:.0f} 秒内一直被占用，本次操作未入账，请稍后重试"
+        )
 
     # -- 内部：基于本馆旧摘要的差分更新 ----------------------------------
 
@@ -190,7 +220,7 @@ class Database:
         branch = validate_identifier("branch", branch)
         registers = validate_registers(registers)
 
-        conn = self._connect()
+        conn = self._connect(for_write=True)
         try:
             self._transaction(conn)
             try:
@@ -257,7 +287,7 @@ class Database:
         resource = validate_identifier("resource", resource)
         branch = validate_identifier("branch", branch)
 
-        conn = self._connect()
+        conn = self._connect(for_write=True)
         try:
             self._transaction(conn)
             try:
@@ -304,7 +334,7 @@ class Database:
         month = validate_month(month)
         resource = validate_identifier("resource", resource)
 
-        conn = self._connect()
+        conn = self._connect(for_write=False)
         try:
             row = conn.execute(
                 "SELECT registers, updated_at FROM merged_summaries "
@@ -330,7 +360,7 @@ class Database:
         resource = validate_identifier("resource", resource)
         branch = validate_identifier("branch", branch)
 
-        conn = self._connect()
+        conn = self._connect(for_write=False)
         try:
             row = conn.execute(
                 "SELECT registers, updated_at FROM branch_reports "

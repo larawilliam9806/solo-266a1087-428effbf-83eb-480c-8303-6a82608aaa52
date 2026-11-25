@@ -29,7 +29,12 @@
 <body>
   <h1>电子资源月度去重读者数 · HLL 摘要报送</h1>
 
-  {% if error %}<div class="err">操作失败：{{ error }}</div>{% endif %}
+  {% if error %}
+  <div class="err" role="alert">
+    操作失败：{{ error }}
+    {% if status == 503 %}<p class="hint">本次请求没有入账，合并摘要未改变。请稍候<strong>重试</strong>同一操作。</p>{% endif %}
+  </div>
+  {% endif %}
   {% if message %}<div class="ok">{{ message }}</div>{% endif %}
 
   <section>
